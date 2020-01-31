@@ -6,17 +6,23 @@
 //
 // author: Ivaylo Petrov <ivajloip@gmail.com>
 
-use crypto::aessafe;
-use crypto::mac::Mac;
-use crypto::symmetriccipher::BlockEncryptor;
+use aes::block_cipher_trait::generic_array::GenericArray;
+use aes::block_cipher_trait::BlockCipher;
+use aes::Aes128;
 
-use super::cmac;
+use cmac::{Cmac, Mac};
+
+use heapless;
+use heapless::consts::*;
+
+type Vec<T> = heapless::Vec<T,U256>;
+
 use super::keys;
 
 /// calculate_data_mic computes the MIC of a correct data packet.
 pub fn calculate_data_mic<'a>(data: &'a [u8], key: &keys::AES128, fcnt: u32) -> keys::MIC {
-    let data_len = data.len();
-    let mut mic_bytes = vec![0; data_len + 16];
+    let mut mic_bytes = Vec::new();
+    mic_bytes.resize(data.len() + 16, 0).unwrap();
 
     // compute b0 from the spec
     generate_helper_block(data, 0x49, fcnt, &mut mic_bytes[..16]);
@@ -43,8 +49,7 @@ fn generate_helper_block(data: &[u8], first: u8, fcnt: u32, res: &mut [u8]) {
 
 /// calculate_mic computes the MIC of a correct data packet.
 pub fn calculate_mic<'a>(data: &'a [u8], key: &keys::AES128) -> keys::MIC {
-    let aes_enc = aessafe::AesSafe128Encryptor::new(&key.0[..]);
-    let mut cipher = cmac::Cmac::new(aes_enc);
+    let mut cipher = Cmac::<Aes128>::new_varkey(&key.0[..]).unwrap();
 
     cipher.input(data);
     let result = cipher.result();
@@ -65,23 +70,23 @@ pub fn encrypt_frm_data_payload<'a>(
     // make the block size a multiple of 16
     let block_size = ((frm_payload.len() + 15) / 16) * 16;
     let mut block = Vec::new();
-    block.extend_from_slice(frm_payload);
-    block.extend_from_slice(&vec![0u8; block_size - frm_payload.len()][..]);
+    block.extend_from_slice(frm_payload).unwrap();
+    block.resize(block_size, 0).unwrap();
 
     let mut a = [0u8; 16];
     generate_helper_block(phy_payload, 0x01, fcnt, &mut a[..]);
 
-    let aes_enc = aessafe::AesSafe128Encryptor::new(&key.0[..]);
+    let aes_enc = Aes128::new(GenericArray::from_slice(&key.0[..]));
     let mut result: Vec<u8> = block
         .chunks(16)
         .enumerate()
         .flat_map(|(i, c)| {
-            let mut tmp = [0u8; 16];
             a[15] = (i + 1) as u8;
-            aes_enc.encrypt_block(&a[..], &mut tmp);
+            let mut b2 = GenericArray::from_mut_slice(&mut a[..]);
+            aes_enc.encrypt_block(&mut b2);
             c.iter()
                 .enumerate()
-                .map(|(j, v)| v ^ tmp[j])
+                .map(|(j, v)| v ^ b2[j])
                 .collect::<Vec<u8>>()
         })
         .collect();

@@ -6,267 +6,19 @@
 //
 // author: Ivaylo Petrov <ivajloip@gmail.com>
 
-use crypto::aessafe;
-use crypto::symmetriccipher::BlockDecryptor;
+use heapless;
+use heapless::consts::*;
+
+type Vec<T> = heapless::Vec<T,U256>;
 
 use super::keys;
 use super::maccommandcreator;
 use super::maccommands;
-use super::parser;
 use super::securityhelpers;
+use crate::parser;
 
 const PIGGYBACK_MAC_COMMANDS_MAX_LEN: usize = 15;
 
-/// JoinAcceptCreator serves for creating binary representation of Physical
-/// Payload of JoinAccept.
-#[derive(Default)]
-pub struct JoinAcceptCreator {
-    data: Vec<u8>,
-    encrypted: bool,
-}
-
-impl JoinAcceptCreator {
-    /// Creates a well initialized JoinAcceptCreator.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut phy = lorawan::creator::JoinAcceptCreator::new();
-    /// let key = lorawan::keys::AES128([1; 16]);
-    /// let app_nonce_bytes = [1; 3];
-    /// phy.set_app_nonce(&app_nonce_bytes);
-    /// phy.set_net_id(&[1; 3]);
-    /// phy.set_dev_addr(&[1; 4]);
-    /// phy.set_dl_settings(2);
-    /// phy.set_rx_delay(1);
-    /// phy.set_c_f_list(vec![lorawan::maccommands::Frequency::new(&[0x58, 0x6e, 0x84,]).unwrap(),
-    ///      lorawan::maccommands::Frequency::new(&[0x88, 0x66, 0x84,]).unwrap()]);
-    /// let payload = phy.build(&key).unwrap();
-    /// ```
-    pub fn new() -> JoinAcceptCreator {
-        let mut data = vec![0; 17];
-        data[0] = 0x20;
-        JoinAcceptCreator {
-            data,
-            ..Default::default()
-        }
-    }
-
-    /// Sets the AppNonce of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * app_nonce - instance of lorawan::parser::AppNonce or anything that can
-    ///   be converted into it.
-    pub fn set_app_nonce<'a, T: Into<parser::AppNonce<'a>>>(
-        &mut self,
-        app_nonce: T,
-    ) -> &mut JoinAcceptCreator {
-        let converted = app_nonce.into();
-        self.data[1..4].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Sets the network ID of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * net_id - instance of lorawan::parser::NwkAddr or anything that can
-    ///   be converted into it.
-    pub fn set_net_id<'a, T: Into<parser::NwkAddr<'a>>>(&mut self, net_id: T) -> &mut JoinAcceptCreator {
-        let converted = net_id.into();
-        self.data[4..7].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Sets the device address of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * dev_addr - instance of lorawan::parser::DevAddr or anything that can
-    ///   be converted into it.
-    pub fn set_dev_addr<'a, T: Into<parser::DevAddr<'a>>>(
-        &mut self,
-        dev_addr: T,
-    ) -> &mut JoinAcceptCreator {
-        let converted = dev_addr.into();
-        self.data[7..11].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Sets the DLSettings of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * dl_settings - instance of lorawan::maccommands::DLSettings or anything
-    ///   that can be converted into it.
-    pub fn set_dl_settings<T: Into<maccommands::DLSettings>>(
-        &mut self,
-        dl_settings: T,
-    ) -> &mut JoinAcceptCreator {
-        let converted = dl_settings.into();
-        self.data[11] = converted.raw_value();
-
-        self
-    }
-
-    /// Sets the RX delay of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * rx_delay - the rx delay for the first receive window.
-    pub fn set_rx_delay(&mut self, rx_delay: u8) -> &mut JoinAcceptCreator {
-        self.data[12] = rx_delay;
-
-        self
-    }
-
-    /// Sets the CFList of the JoinAccept to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * ch_list - list of Frequences to be sent to the device.
-    pub fn set_c_f_list(
-        &mut self,
-        ch_list: Vec<maccommands::Frequency>,
-    ) -> Result<&mut JoinAcceptCreator, &str> {
-        if ch_list.len() > 5 {
-            return Err("too many frequences");
-        }
-        if self.data.len() < 33 {
-            self.data.resize(33, 0);
-        }
-        ch_list.iter().enumerate().for_each(|(i, fr)| {
-            let v = fr.value() / 100;
-            self.data[13 + i * 3] = (v & 0xff) as u8;
-            self.data[14 + i * 3] = ((v >> 8) & 0xff) as u8;
-            self.data[15 + i * 3] = ((v >> 16) & 0xff) as u8;
-        });
-
-        Ok(self)
-    }
-
-    /// Provides the binary representation of the encrypted join accept
-    /// physical payload with the MIC set.
-    ///
-    /// # Argument
-    ///
-    /// * key - the key to be used for encryption and setting the MIC.
-    pub fn build(&mut self, key: &keys::AES128) -> Result<&[u8], &str> {
-        if !self.encrypted {
-            self.encrypt_payload(key);
-        }
-        Ok(&self.data[..])
-    }
-
-    fn encrypt_payload(&mut self, key: &keys::AES128) {
-        set_mic(&mut self.data[..], key);
-        let aes_enc = aessafe::AesSafe128Decryptor::new(&key.0[..]);
-        let mut tmp = vec![0; 16];
-        for i in 0..(self.data.len() >> 4) {
-            let start = (i << 4) + 1;
-            aes_enc.decrypt_block(&self.data[start..(start + 16)], &mut tmp[..]);
-            self.data[start..(16 + start)].clone_from_slice(&tmp[..16])
-        }
-        self.encrypted = true;
-    }
-}
-
-fn set_mic(data: &mut [u8], key: &keys::AES128) {
-    let len = data.len();
-    let mic = securityhelpers::calculate_mic(&data[..len - 4], key);
-
-    data[len - 4..].copy_from_slice(&mic.0[..]);
-}
-
-/// JoinRequestCreator serves for creating binary representation of Physical
-/// Payload of JoinRequest.
-#[derive(Default)]
-pub struct JoinRequestCreator {
-    data: Vec<u8>,
-}
-
-impl JoinRequestCreator {
-    /// Creates a well initialized JoinRequestCreator.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut phy = lorawan::creator::JoinRequestCreator::new();
-    /// let key = lorawan::keys::AES128([7; 16]);
-    /// phy.set_app_eui(&[1; 8]);
-    /// phy.set_dev_eui(&[2; 8]);
-    /// phy.set_dev_nonce(&[3; 2]);
-    /// let payload = phy.build(&key).unwrap();
-    /// ```
-    pub fn new() -> JoinRequestCreator {
-        let mut data = vec![0; 23];
-        data[0] = 0x00;
-        JoinRequestCreator { data }
-    }
-
-    /// Sets the application EUI of the JoinRequest to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * app_eui - instance of lorawan::parser::EUI64 or anything that can
-    ///   be converted into it.
-    pub fn set_app_eui<'a, T: Into<parser::EUI64<'a>>>(
-        &mut self,
-        app_eui: T,
-    ) -> &mut JoinRequestCreator {
-        let converted = app_eui.into();
-        self.data[1..9].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Sets the device EUI of the JoinRequest to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * dev_eui - instance of lorawan::parser::EUI64 or anything that can
-    ///   be converted into it.
-    pub fn set_dev_eui<'a, T: Into<parser::EUI64<'a>>>(
-        &mut self,
-        dev_eui: T,
-    ) -> &mut JoinRequestCreator {
-        let converted = dev_eui.into();
-        self.data[9..17].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Sets the device nonce of the JoinRequest to the provided value.
-    ///
-    /// # Argument
-    ///
-    /// * dev_nonce - instance of lorawan::parser::DevNonce or anything that can
-    ///   be converted into it.
-    pub fn set_dev_nonce<'a, T: Into<parser::DevNonce<'a>>>(
-        &mut self,
-        dev_nonce: T,
-    ) -> &mut JoinRequestCreator {
-        let converted = dev_nonce.into();
-        self.data[17..19].copy_from_slice(converted.as_ref());
-
-        self
-    }
-
-    /// Provides the binary representation of the JoinRequest physical payload
-    /// with the MIC set.
-    ///
-    /// # Argument
-    ///
-    /// * key - the key to be used for setting the MIC.
-    pub fn build(&mut self, key: &keys::AES128) -> Result<&[u8], &str> {
-        set_mic(&mut self.data[..], key);
-        Ok(&self.data[..])
-    }
-}
 
 /// DataPayloadCreator serves for creating binary representation of Physical
 /// Payload of DataUp or DataDown messages.
@@ -300,7 +52,8 @@ impl DataPayloadCreator {
     /// let payload = phy.build(b"hello", &nwk_skey, &app_skey).unwrap();
     /// ```
     pub fn new() -> DataPayloadCreator {
-        let mut data = vec![0; 12];
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0; 12]).unwrap();
         data[0] = 0x40;
         DataPayloadCreator {
             data,
@@ -514,10 +267,7 @@ impl DataPayloadCreator {
         let additional_bytes_needed = last_filled + payload_len + 4 - self.data.len();
         if additional_bytes_needed > 0 {
             // we don't have enough length to accomodate all the bytes
-            self.data.reserve_exact(additional_bytes_needed);
-            unsafe {
-                self.data.set_len(last_filled + payload_len + 4);
-            }
+            return Err("not enough Array space");
         }
         if payload_len > 0 {
             self.data[last_filled..last_filled + payload_len]
